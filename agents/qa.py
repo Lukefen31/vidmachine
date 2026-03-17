@@ -1,194 +1,420 @@
 """
-QA Agent — audits all exported outputs for quality issues.
-Decides whether the pipeline is done or needs a re-run of a prior phase.
+QA Agent — audits exported videos for quality issues before the pipeline ends.
+
+Checks performed:
+  1. File existence       — all output_paths exist on disk
+  2. Duration check       — output duration vs blueprint duration_target (warn if >10% off)
+  3. Audio sync           — video and audio stream lengths match (via ffprobe)
+  4. Resolution check     — 16:9 output has correct resolution; 9:16 has correct vertical res
+  5. File size sanity     — warn if <1 MB (likely corrupt) or >2 GB (may need re-encode)
+  6. Beat alignment audit — sample cut points from blueprint and check actual frame alignment
+
+Results are stored in state["phase_results"]["qa"]:
+  {passed: bool, checks: [{name, status, detail}], score: int 0-100}
+
+Routing:
+  - All pass: next_phase = "done"
+  - Critical failure: next_phase = "assembly" or "export" depending on failure type
+  - Warnings only: next_phase = "done" (with warnings)
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import subprocess
+from typing import Literal
+
 import os
-from pathlib import Path
-from typing import TYPE_CHECKING
 
 from agents.base import BaseAgent
+from state.project_state import ProjectState
+from state.blueprint import VideoBlueprint
+from tools import ffmpeg_tools
 
-if TYPE_CHECKING:
-    from state.project_state import ProjectState
+logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Check status literals
+# ---------------------------------------------------------------------------
+
+CheckStatus = Literal["pass", "warn", "fail", "skip"]
+
+
+def _check(name: str, status: CheckStatus, detail: str) -> dict:
+    return {"name": name, "status": status, "detail": detail}
+
+
+# ---------------------------------------------------------------------------
+# QA Agent
+# ---------------------------------------------------------------------------
 
 class QAAgent(BaseAgent):
+    """
+    Audits the exported video files against the blueprint specification.
+
+    Reads:
+      state["output_paths"]            — paths to final outputs
+      state["blueprint"]               — target spec (resolution, duration, fps, variants)
+      state["phase_results"]["export"] — export metadata
+
+    Writes:
+      state["phase_results"]["qa"]     — {passed, checks, score}
+      state["agent_notes"]["qa"]       — plain-English summary for Director
+      state["next_phase"]              — "done" | "export" | "assembly"
+    """
+
+    # Thresholds
+    DURATION_TOLERANCE = 0.10                    # 10% deviation triggers warning
+    AUDIO_SYNC_TOLERANCE = 0.5                   # seconds — max acceptable A/V length mismatch
+    MIN_FILE_SIZE_BYTES = 1 * 1024 * 1024        # 1 MB
+    MAX_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024 # 2 GB
+    BEAT_ALIGN_TOLERANCE_FRAMES = 1              # allow ±1 frame
 
     @property
     def name(self) -> str:
         return "qa"
 
-    def run(self, state: "ProjectState") -> "ProjectState":
-        self.log("Starting quality audit")
-
-        output_paths: dict = state.get("output_paths", {})
-        blueprint: dict = state.get("blueprint", {})
-        output_cfg: dict = blueprint.get("output", {})
-        duration_target: float | None = output_cfg.get("duration_target")
-        expected_res: list = output_cfg.get("resolution", [1920, 1080])
-        variants: list = output_cfg.get("variants", ["16:9"])
+    def run(self, state: ProjectState) -> ProjectState:
+        blueprint_dict = state.get("blueprint", {})
+        blueprint = VideoBlueprint.from_dict(blueprint_dict)
+        output_paths = state.get("output_paths", {})
+        output_cfg = blueprint.output
 
         checks: list[dict] = []
-        critical_failures: list[str] = []
-        warnings: list[str] = []
+        critical_failures: list[str] = []   # stage names that need re-run
+        has_warnings = False
 
-        # ── 1. File existence ─────────────────────────────────────────────────
-        for label, path in output_paths.items():
-            if path and Path(path).exists():
-                checks.append({"name": f"File exists ({label})", "status": "pass", "detail": path})
+        # ── 1. File existence ──────────────────────────────────────────────────
+        expected_outputs: dict[str, str] = {}
+        if "16:9" in output_cfg.variants or not output_cfg.variants:
+            expected_outputs["final_16x9"] = output_paths.get("final_16x9", "")
+        if "9:16" in output_cfg.variants:
+            expected_outputs["final_9x16"] = output_paths.get("final_9x16", "")
+
+        for label, path in expected_outputs.items():
+            if path and os.path.exists(path):
+                checks.append(_check(
+                    f"file_exists_{label}", "pass",
+                    f"{label} exists at {path}"
+                ))
             else:
-                checks.append({"name": f"File exists ({label})", "status": "fail", "detail": f"Not found: {path}"})
-                critical_failures.append(f"Output file missing: {label}")
+                checks.append(_check(
+                    f"file_exists_{label}", "fail",
+                    f"{label} not found — expected at: {path or '(no path recorded)'}"
+                ))
+                critical_failures.append("export")
 
-        if not output_paths:
-            checks.append({"name": "Output files", "status": "fail", "detail": "No output paths recorded"})
-            critical_failures.append("No output files were produced")
+        # Collect video info for all existing outputs (used by later checks)
+        video_infos: dict[str, dict] = {}
+        for label, path in expected_outputs.items():
+            if path and os.path.exists(path):
+                info = ffmpeg_tools.get_video_info(path)
+                video_infos[label] = info if info else {}
 
-        # ── 2. File size sanity ───────────────────────────────────────────────
-        for label, path in output_paths.items():
-            if path and Path(path).exists():
-                size_mb = Path(path).stat().st_size / (1024 * 1024)
-                if size_mb < 0.5:
-                    checks.append({"name": f"File size ({label})", "status": "fail", "detail": f"{size_mb:.2f} MB — likely corrupt"})
-                    critical_failures.append(f"Output {label} is suspiciously small ({size_mb:.2f} MB)")
-                elif size_mb > 4096:
-                    checks.append({"name": f"File size ({label})", "status": "warn", "detail": f"{size_mb:.0f} MB — very large"})
-                    warnings.append(f"Output {label} is very large ({size_mb:.0f} MB)")
-                else:
-                    checks.append({"name": f"File size ({label})", "status": "pass", "detail": f"{size_mb:.1f} MB"})
+        # ── 2. Duration check ─────────────────────────────────────────────────
+        target_duration: float | None = output_cfg.duration_target
+        if target_duration is None:
+            assembled = blueprint.total_video_duration()
+            target_duration = assembled if assembled > 0 else None
 
-        # ── 3. Duration + resolution via ffprobe ──────────────────────────────
-        try:
-            from tools.ffmpeg_tools import get_video_info
-            ffprobe_available = True
-        except ImportError:
-            ffprobe_available = False
-            warnings.append("ffprobe unavailable — skipping duration/resolution checks")
-
-        if ffprobe_available:
-            for label, path in output_paths.items():
-                if not (path and Path(path).exists()):
+        if target_duration and target_duration > 0:
+            for label, info in video_infos.items():
+                actual_dur = info.get("duration", 0.0)
+                if actual_dur <= 0:
+                    checks.append(_check(
+                        f"duration_{label}", "warn",
+                        f"Could not read duration for {label}"
+                    ))
+                    has_warnings = True
                     continue
-
-                info = get_video_info(path)
-                if not info:
-                    checks.append({"name": f"Probe ({label})", "status": "warn", "detail": "ffprobe returned no data"})
-                    warnings.append(f"Could not probe {label}")
-                    continue
-
-                # Duration check
-                actual_dur = info.get("duration", 0)
-                if duration_target and actual_dur > 0:
-                    ratio = abs(actual_dur - duration_target) / duration_target
-                    if ratio > 0.15:
-                        checks.append({
-                            "name": f"Duration ({label})",
-                            "status": "warn",
-                            "detail": f"Expected ~{duration_target:.1f}s, got {actual_dur:.1f}s ({ratio*100:.0f}% off)",
-                        })
-                        warnings.append(f"Duration mismatch on {label}: {actual_dur:.1f}s vs target {duration_target:.1f}s")
-                    else:
-                        checks.append({"name": f"Duration ({label})", "status": "pass", "detail": f"{actual_dur:.1f}s"})
-
-                # Resolution check for 16:9
-                if label == "final_16x9":
-                    w, h = info.get("width", 0), info.get("height", 0)
-                    exp_w, exp_h = expected_res[0], expected_res[1]
-                    if w != exp_w or h != exp_h:
-                        checks.append({
-                            "name": f"Resolution ({label})",
-                            "status": "warn",
-                            "detail": f"Expected {exp_w}x{exp_h}, got {w}x{h}",
-                        })
-                        warnings.append(f"Resolution mismatch on {label}")
-                    else:
-                        checks.append({"name": f"Resolution ({label})", "status": "pass", "detail": f"{w}x{h}"})
-
-                # Resolution check for 9:16
-                if label == "final_9x16":
-                    w, h = info.get("width", 0), info.get("height", 0)
-                    if w > h:
-                        checks.append({
-                            "name": f"Orientation ({label})",
-                            "status": "fail",
-                            "detail": f"Expected vertical (9:16) but got {w}x{h} (landscape)",
-                        })
-                        critical_failures.append(f"9:16 export is landscape, not vertical: {w}x{h}")
-                    else:
-                        checks.append({"name": f"Orientation ({label})", "status": "pass", "detail": f"{w}x{h} ✓ vertical"})
-
-                # Audio/video stream sync
-                audio_codec = info.get("audio_codec", "")
-                if not audio_codec:
-                    checks.append({"name": f"Audio stream ({label})", "status": "warn", "detail": "No audio stream detected"})
-                    warnings.append(f"No audio stream in {label}")
+                deviation = abs(actual_dur - target_duration) / target_duration
+                if deviation > self.DURATION_TOLERANCE:
+                    status: CheckStatus = "warn"
+                    has_warnings = True
+                    detail = (
+                        f"{label} duration {actual_dur:.2f}s deviates {deviation*100:.1f}% "
+                        f"from target {target_duration:.2f}s (>{self.DURATION_TOLERANCE*100:.0f}% threshold)"
+                    )
                 else:
-                    checks.append({"name": f"Audio stream ({label})", "status": "pass", "detail": audio_codec})
+                    status = "pass"
+                    detail = (
+                        f"{label} duration {actual_dur:.2f}s — "
+                        f"within {deviation*100:.1f}% of target {target_duration:.2f}s"
+                    )
+                checks.append(_check(f"duration_{label}", status, detail))
+        else:
+            checks.append(_check(
+                "duration", "skip",
+                "No duration_target set in blueprint and no assembled clips; skipping duration check"
+            ))
 
-        # ── 4. Variant coverage ───────────────────────────────────────────────
-        if "9:16" in variants and "final_9x16" not in output_paths:
-            checks.append({"name": "9:16 variant", "status": "warn", "detail": "Requested but not produced"})
-            warnings.append("9:16 variant was requested but not found in output_paths")
+        # ── 3. Audio sync check ───────────────────────────────────────────────
+        for label, info in video_infos.items():
+            path = expected_outputs.get(label, "")
+            if not path:
+                continue
+            try:
+                ffprobe_bin = ffmpeg_tools._ffprobe_bin()
+                raw = subprocess.run(
+                    [
+                        ffprobe_bin, "-v", "quiet",
+                        "-print_format", "json",
+                        "-show_streams",
+                        path,
+                    ],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if raw.returncode == 0:
+                    streams = json.loads(raw.stdout).get("streams", [])
+                    vid_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+                    aud_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+                    if vid_stream and aud_stream:
+                        v_dur = float(vid_stream.get("duration") or 0)
+                        a_dur = float(aud_stream.get("duration") or 0)
+                        if v_dur > 0 and a_dur > 0:
+                            diff = abs(v_dur - a_dur)
+                            if diff > self.AUDIO_SYNC_TOLERANCE:
+                                checks.append(_check(
+                                    f"audio_sync_{label}", "warn",
+                                    f"{label} A/V length mismatch: video={v_dur:.3f}s audio={a_dur:.3f}s "
+                                    f"(diff={diff:.3f}s > {self.AUDIO_SYNC_TOLERANCE}s threshold)"
+                                ))
+                                has_warnings = True
+                            else:
+                                checks.append(_check(
+                                    f"audio_sync_{label}", "pass",
+                                    f"{label} audio/video durations match (diff={diff:.3f}s)"
+                                ))
+                        else:
+                            checks.append(_check(
+                                f"audio_sync_{label}", "skip",
+                                f"Could not read per-stream durations for {label}"
+                            ))
+                    elif not aud_stream:
+                        checks.append(_check(
+                            f"audio_sync_{label}", "warn",
+                            f"{label} has no audio stream detected"
+                        ))
+                        has_warnings = True
+                    else:
+                        checks.append(_check(
+                            f"audio_sync_{label}", "skip",
+                            f"Could not find both video and audio streams for {label}"
+                        ))
+                else:
+                    checks.append(_check(
+                        f"audio_sync_{label}", "skip",
+                        f"ffprobe returned non-zero for {label}"
+                    ))
+            except Exception as exc:
+                checks.append(_check(
+                    f"audio_sync_{label}", "skip",
+                    f"Audio sync check error for {label}: {exc}"
+                ))
 
-        # ── Scoring ───────────────────────────────────────────────────────────
-        n_pass = sum(1 for c in checks if c["status"] == "pass")
-        n_warn = sum(1 for c in checks if c["status"] == "warn")
-        n_fail = sum(1 for c in checks if c["status"] == "fail")
-        total = len(checks) or 1
-        score = int((n_pass / total) * 100 - (n_warn * 3) - (n_fail * 15))
-        score = max(0, min(100, score))
+        # ── 4. Resolution check ───────────────────────────────────────────────
+        target_w, target_h = output_cfg.resolution
 
-        passed = len(critical_failures) == 0
+        if "final_16x9" in video_infos:
+            info = video_infos["final_16x9"]
+            actual_w = info.get("width", 0)
+            actual_h = info.get("height", 0)
+            if actual_w == target_w and actual_h == target_h:
+                checks.append(_check(
+                    "resolution_16x9", "pass",
+                    f"16:9 output is {actual_w}x{actual_h} (matches target {target_w}x{target_h})"
+                ))
+            elif actual_w > 0 and actual_h > 0:
+                checks.append(_check(
+                    "resolution_16x9", "warn",
+                    f"16:9 output is {actual_w}x{actual_h}, expected {target_w}x{target_h}"
+                ))
+                has_warnings = True
+            else:
+                checks.append(_check(
+                    "resolution_16x9", "fail",
+                    "Could not read resolution for 16:9 output"
+                ))
+                critical_failures.append("export")
 
-        result = {
-            "passed": passed,
-            "score": score,
-            "checks": checks,
-            "critical_failures": critical_failures,
-            "warnings": warnings,
-            "n_pass": n_pass,
-            "n_warn": n_warn,
-            "n_fail": n_fail,
-        }
+        if "final_9x16" in video_infos:
+            info = video_infos["final_9x16"]
+            actual_w = info.get("width", 0)
+            actual_h = info.get("height", 0)
+            reframe_cfg = blueprint.reframe_9x16
+            expected_9x16_h = reframe_cfg.target_height
 
-        self.write_result(state, result)
-        state["current_phase"] = "qa"
+            if actual_h == expected_9x16_h:
+                checks.append(_check(
+                    "resolution_9x16", "pass",
+                    f"9:16 output is {actual_w}x{actual_h} (vertical height {actual_h} matches target {expected_9x16_h})"
+                ))
+            elif actual_h > 0:
+                checks.append(_check(
+                    "resolution_9x16", "warn",
+                    f"9:16 output is {actual_w}x{actual_h}, expected height {expected_9x16_h}"
+                ))
+                has_warnings = True
+            else:
+                checks.append(_check(
+                    "resolution_9x16", "fail",
+                    "Could not read resolution for 9:16 output"
+                ))
+                critical_failures.append("export")
+
+        # ── 5. File size sanity ───────────────────────────────────────────────
+        for label, info in video_infos.items():
+            size = info.get("file_size_bytes", 0)
+            if size == 0:
+                checks.append(_check(
+                    f"file_size_{label}", "skip",
+                    f"Could not read file size for {label}"
+                ))
+            elif size < self.MIN_FILE_SIZE_BYTES:
+                size_kb = size / 1024
+                checks.append(_check(
+                    f"file_size_{label}", "fail",
+                    f"{label} is only {size_kb:.1f} KB — likely corrupt (threshold: 1 MB)"
+                ))
+                critical_failures.append("export")
+            elif size > self.MAX_FILE_SIZE_BYTES:
+                size_gb = size / (1024 ** 3)
+                checks.append(_check(
+                    f"file_size_{label}", "warn",
+                    f"{label} is {size_gb:.2f} GB — may need re-encode (threshold: 2 GB)"
+                ))
+                has_warnings = True
+            else:
+                size_mb = size / (1024 * 1024)
+                checks.append(_check(
+                    f"file_size_{label}", "pass",
+                    f"{label} file size is {size_mb:.1f} MB — within acceptable range"
+                ))
+
+        # ── 6. Beat alignment audit ───────────────────────────────────────────
+        beat_map = blueprint.beat_map
+        video_clips = blueprint.tracks.video
+        fps = output_cfg.fps
+
+        if beat_map and video_clips and fps > 0:
+            frame_duration = 1.0 / fps
+            tolerance_secs = self.BEAT_ALIGN_TOLERANCE_FRAMES * frame_duration
+
+            # Sample up to 5 beat-aligned clips for spot-check
+            beat_aligned_clips = [c for c in video_clips if c.beat_aligned]
+            sample = beat_aligned_clips[:5]
+
+            beat_mismatches = 0
+            beat_details: list[str] = []
+
+            for clip in sample:
+                cut_time = clip.timeline_position
+                nearest_beat = min(beat_map, key=lambda b: abs(b - cut_time))
+                diff = abs(cut_time - nearest_beat)
+                if diff <= tolerance_secs:
+                    beat_details.append(
+                        f"clip@{cut_time:.3f}s nearest_beat={nearest_beat:.3f}s diff={diff*1000:.1f}ms OK"
+                    )
+                else:
+                    beat_mismatches += 1
+                    beat_details.append(
+                        f"clip@{cut_time:.3f}s nearest_beat={nearest_beat:.3f}s diff={diff*1000:.1f}ms MISS"
+                    )
+
+            if sample:
+                if beat_mismatches == 0:
+                    checks.append(_check(
+                        "beat_alignment", "pass",
+                        f"Beat alignment OK — {len(sample)} sampled cuts all within "
+                        f"±{self.BEAT_ALIGN_TOLERANCE_FRAMES} frame(s). "
+                        + " | ".join(beat_details)
+                    ))
+                else:
+                    checks.append(_check(
+                        "beat_alignment", "warn",
+                        f"{beat_mismatches}/{len(sample)} sampled cuts are off-beat (>{tolerance_secs*1000:.1f}ms). "
+                        + " | ".join(beat_details)
+                    ))
+                    has_warnings = True
+            else:
+                checks.append(_check(
+                    "beat_alignment", "skip",
+                    "No beat-aligned clips found in blueprint; skipping beat alignment audit"
+                ))
+        else:
+            checks.append(_check(
+                "beat_alignment", "skip",
+                "No beat_map or video clips in blueprint; skipping beat alignment audit"
+            ))
+
+        # ── Score calculation ─────────────────────────────────────────────────
+        # pass=full credit, warn=half credit, skip=neutral (full credit), fail=0
+        status_weights: dict[str, float] = {"pass": 1.0, "warn": 0.5, "skip": 1.0, "fail": 0.0}
+        scored_checks = [c for c in checks if c["status"] != "skip"]
+        if scored_checks:
+            score = int(
+                100 * sum(status_weights[c["status"]] for c in scored_checks) / len(scored_checks)
+            )
+        else:
+            score = 100  # nothing to score — assume ok
+
+        # ── Overall pass/fail ─────────────────────────────────────────────────
+        has_critical = len(critical_failures) > 0
+        passed = not has_critical
 
         # ── Routing ───────────────────────────────────────────────────────────
-        if passed:
-            state["next_phase"] = "done"
-            note = (
-                f"QA PASSED ✅ Score: {score}/100. "
-                f"{n_pass} checks passed, {n_warn} warnings, {n_fail} failures. "
-                f"Pipeline complete. Outputs: {list(output_paths.values())}"
-            )
-            self.log(f"All checks passed — score {score}/100")
-        else:
-            # Determine which phase to retry
-            export_failures = [f for f in critical_failures if "output" in f.lower() or "corrupt" in f.lower()]
-            if export_failures:
-                state["next_phase"] = "export"
-                retry_phase = "export"
-            else:
+        if has_critical:
+            if "assembly" in critical_failures:
                 state["next_phase"] = "assembly"
-                retry_phase = "assembly"
+            else:
+                state["next_phase"] = "export"
+        else:
+            state["next_phase"] = "done"
 
-            note = (
-                f"QA FAILED ❌ Score: {score}/100. "
-                f"Critical failures: {critical_failures}. "
-                f"Routing back to {retry_phase}."
+        # ── Write structured result ────────────────────────────────────────────
+        qa_result = {
+            "passed": passed,
+            "checks": checks,
+            "score": score,
+            "critical_failures": list(set(critical_failures)),
+            "has_warnings": has_warnings,
+        }
+        self.write_result(state, qa_result)
+
+        # ── Human-readable note ───────────────────────────────────────────────
+        note_lines = ["QA AGENT REPORT", "=" * 40]
+        overall = "PASSED" if passed else "FAILED"
+        note_lines.append(
+            f"Overall: {overall}  |  Score: {score}/100  |  Next phase: {state['next_phase']}"
+        )
+        note_lines.append("")
+
+        pass_count = sum(1 for c in checks if c["status"] == "pass")
+        warn_count = sum(1 for c in checks if c["status"] == "warn")
+        fail_count = sum(1 for c in checks if c["status"] == "fail")
+        skip_count = sum(1 for c in checks if c["status"] == "skip")
+        note_lines.append(
+            f"Checks: {pass_count} passed | {warn_count} warned | {fail_count} failed | {skip_count} skipped"
+        )
+        note_lines.append("")
+
+        for check in checks:
+            icon = {"pass": "[OK]", "warn": "[WARN]", "fail": "[FAIL]", "skip": "[SKIP]"}[check["status"]]
+            note_lines.append(f"  {icon} {check['name']}: {check['detail']}")
+
+        note_lines.append("")
+        if has_critical:
+            note_lines.append(
+                f"CRITICAL FAILURES detected — routing back to: {state['next_phase'].upper()}"
             )
-            self.log(f"Failures detected — routing to {retry_phase}", level="warning")
-            for f in critical_failures:
-                self.add_error(state, f)
+            note_lines.append("Director should re-trigger the failed stage.")
+        elif has_warnings:
+            note_lines.append("Warnings present but no critical failures — marking pipeline as done.")
+        else:
+            note_lines.append("All checks passed cleanly. Pipeline complete.")
 
-        for w in warnings:
-            self.add_warning(state, w)
-
-        self.write_note(state, note)
-        self.show_panel("QA Report", note)
+        self.write_note(state, "\n".join(note_lines))
+        self.show_panel("QA Report", "\n".join(note_lines))
 
         return state
